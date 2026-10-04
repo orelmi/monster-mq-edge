@@ -1,24 +1,30 @@
 /*
  * abi_harness.c - plain C host for the MonsterMQ Edge C ABI (AC-05, AC-08,
- * AC-09 host-side checks). It links libmonstermq.a through the published
- * header only, runs a minimal "manager thread" that answers requests, and
- * exercises the documented edge cases. It needs no WinCC OA SDK.
+ * AC-09 host-side checks). It links libmonstermq.a (Linux) or monstermq.dll
+ * through its import library (Windows) via the published header only, runs a
+ * minimal "manager thread" that answers requests, and exercises the
+ * documented edge cases. It needs no WinCC OA SDK.
  *
- * Run from embed/harness (make embed-test).
+ * Run from embed/harness (make embed-test, make embed-dll-test or
+ * winccoa\build.bat --test).
  */
 #define _GNU_SOURCE
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#else
 #include <arpa/inet.h>
-#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "monstermq.h"
 
@@ -43,17 +49,85 @@ typedef struct req {
   struct req *next;
 } req;
 
+/* ---- platform layer: POSIX threads and sockets, or Win32 and Winsock ---- */
+
+static void manager_loop(void);
+
+#ifdef _WIN32
+typedef SOCKET sock_t;
+static SRWLOCK qmu = SRWLOCK_INIT;
+static CONDITION_VARIABLE qcv = CONDITION_VARIABLE_INIT;
+static HANDLE manager_thread;
+static DWORD manager_tid;
+
+static void q_lock(void) { AcquireSRWLockExclusive(&qmu); }
+static void q_unlock(void) { ReleaseSRWLockExclusive(&qmu); }
+static void q_wait_10ms(void) { SleepConditionVariableSRW(&qcv, &qmu, 10, 0); }
+static void q_signal(void) { WakeConditionVariable(&qcv); }
+
+static DWORD WINAPI manager_main(LPVOID arg) {
+  (void)arg;
+  manager_loop();
+  return 0;
+}
+static void manager_start(void) { manager_thread = CreateThread(NULL, 0, manager_main, NULL, 0, &manager_tid); }
+static void manager_join(void) {
+  WaitForSingleObject(manager_thread, INFINITE);
+  CloseHandle(manager_thread);
+}
+static int on_manager_thread(void) { return GetCurrentThreadId() == manager_tid; }
+
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+
+static int64_t now_ms(void) {
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  return (int64_t)(t / 10000) - 11644473600000LL; /* 100 ns ticks since 1601 */
+}
+
+static void platform_init(void) {
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+}
+static void sock_close(sock_t s) { closesocket(s); }
+static void sock_recv_timeout(sock_t s, int seconds) {
+  DWORD ms = (DWORD)seconds * 1000;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof(ms));
+}
+/* SO_REUSEADDR on Windows lets a second socket bind a port that is in use,
+ * which would defeat the occupied/free port checks. */
+static void sock_reuse_addr(sock_t s) { (void)s; }
+#else
+typedef int sock_t;
 static pthread_mutex_t qmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t qcv = PTHREAD_COND_INITIALIZER;
-static req *qhead, *qtail;
-static int qlen;
-static const int qcap = 64;
-static atomic_int running = 1;
-static atomic_ulong handle_g;
-static atomic_int submits, resolves, logs;
-static char last_resolve[256];
-static pthread_t manager_tid;
-static atomic_int submit_from_manager;
+static pthread_t manager_thread;
+
+static void q_lock(void) { pthread_mutex_lock(&qmu); }
+static void q_unlock(void) { pthread_mutex_unlock(&qmu); }
+static void q_wait_10ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_nsec += 10 * 1000000;
+  if (ts.tv_nsec >= 1000000000) {
+    ts.tv_sec++;
+    ts.tv_nsec -= 1000000000;
+  }
+  pthread_cond_timedwait(&qcv, &qmu, &ts);
+}
+static void q_signal(void) { pthread_cond_signal(&qcv); }
+
+static void *manager_main(void *arg) {
+  (void)arg;
+  manager_loop();
+  return NULL;
+}
+static void manager_start(void) { pthread_create(&manager_thread, NULL, manager_main, NULL); }
+static void manager_join(void) { pthread_join(manager_thread, NULL); }
+static int on_manager_thread(void) { return pthread_equal(pthread_self(), manager_thread); }
+
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 
 static int64_t now_ms(void) {
   struct timespec ts;
@@ -61,12 +135,36 @@ static int64_t now_ms(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static void platform_init(void) {}
+static void sock_close(sock_t s) { close(s); }
+static void sock_recv_timeout(sock_t s, int seconds) {
+  struct timeval tv = {seconds, 0};
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+static void sock_reuse_addr(sock_t s) {
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+}
+#endif
+
+static int sock_send(sock_t s, const void *p, int n) { return (int)send(s, (const char *)p, n, 0); }
+static int sock_recv(sock_t s, void *p, int n) { return (int)recv(s, (char *)p, n, 0); }
+
+static req *qhead, *qtail;
+static int qlen;
+static const int qcap = 64;
+static atomic_int running = 1;
+static _Atomic uint64_t handle_g;
+static atomic_int submits, resolves, logs;
+static char last_resolve[256];
+static atomic_int submit_from_manager;
+
 static int32_t host_submit(void *user, uint64_t id, int64_t deadline, const uint8_t *data, uint32_t len) {
   (void)user;
-  if (pthread_equal(pthread_self(), manager_tid)) atomic_fetch_add(&submit_from_manager, 1);
-  pthread_mutex_lock(&qmu);
+  if (on_manager_thread()) atomic_fetch_add(&submit_from_manager, 1);
+  q_lock();
   if (qlen >= qcap) {
-    pthread_mutex_unlock(&qmu);
+    q_unlock();
     return MMQ_E_OVERLOAD;
   }
   req *r = calloc(1, sizeof(req));
@@ -81,13 +179,13 @@ static int32_t host_submit(void *user, uint64_t id, int64_t deadline, const uint
   qtail = r;
   qlen++;
   atomic_fetch_add(&submits, 1);
-  pthread_mutex_unlock(&qmu);
+  q_unlock();
   return MMQ_OK;
 }
 
 static void host_wake(void *user) {
   (void)user;
-  pthread_cond_signal(&qcv);
+  q_signal();
 }
 
 static void host_log(void *user, int32_t level, const char *msg, uint32_t len) {
@@ -133,27 +231,17 @@ static uint32_t op_of(const req *r) {
   return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static void *manager_thread(void *arg) {
-  (void)arg;
+static void manager_loop(void) {
   while (atomic_load(&running)) {
-    pthread_mutex_lock(&qmu);
-    while (!qhead && atomic_load(&running)) {
-      struct timespec ts;
-      clock_gettime(CLOCK_REALTIME, &ts);
-      ts.tv_nsec += 10 * 1000000;
-      if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec++;
-        ts.tv_nsec -= 1000000000;
-      }
-      pthread_cond_timedwait(&qcv, &qmu, &ts);
-    }
+    q_lock();
+    while (!qhead && atomic_load(&running)) q_wait_10ms();
     req *r = qhead;
     if (r) {
       qhead = r->next;
       if (!qhead) qtail = NULL;
       qlen--;
     }
-    pthread_mutex_unlock(&qmu);
+    q_unlock();
     if (!r) continue;
 
     uint64_t h = atomic_load(&handle_g);
@@ -194,7 +282,6 @@ static void *manager_thread(void *arg) {
     free(r->data);
     free(r);
   }
-  return NULL;
 }
 
 /* ---- helpers ---- */
@@ -227,28 +314,27 @@ static int wait_state(uint64_t h, int want, int ms) {
   for (int i = 0; i < ms / 10; i++) {
     st = mmq_state(h, NULL, 0, NULL);
     if (st == want || st == MMQ_STATE_FAILED) return st;
-    usleep(10000);
+    sleep_ms(10);
   }
   return st;
 }
 
 static int mqtt_subscribe_code(int port, const char *filter) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in a;
   memset(&a, 0, sizeof(a));
   a.sin_family = AF_INET;
   a.sin_port = htons((uint16_t)port);
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
-    close(fd);
+    sock_close(fd);
     return -1;
   }
-  struct timeval tv = {5, 0};
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  sock_recv_timeout(fd, 5);
   const uint8_t conn[] = {0x10, 16, 0, 4, 'M', 'Q', 'T', 'T', 4, 2, 0, 60, 0, 4, 'h', 'a', 'r', 'n'};
-  if (write(fd, conn, sizeof(conn)) != (ssize_t)sizeof(conn)) goto fail;
+  if (sock_send(fd, conn, (int)sizeof(conn)) != (int)sizeof(conn)) goto fail;
   uint8_t ack[4];
-  if (read(fd, ack, 4) != 4 || ack[0] != 0x20 || ack[3] != 0) goto fail;
+  if (sock_recv(fd, ack, 4) != 4 || ack[0] != 0x20 || ack[3] != 0) goto fail;
   uint8_t sub[256];
   size_t fl = strlen(filter);
   size_t rem = 2 + 2 + fl + 1;
@@ -262,21 +348,23 @@ static int mqtt_subscribe_code(int port, const char *filter) {
   memcpy(sub + o, filter, fl);
   o += fl;
   sub[o++] = 1;
-  if (write(fd, sub, o) != (ssize_t)o) goto fail;
+  if (sock_send(fd, sub, (int)o) != (int)o) goto fail;
   uint8_t sa[5];
-  if (read(fd, sa, 5) != 5 || sa[0] != 0x90) goto fail;
-  close(fd);
+  if (sock_recv(fd, sa, 5) != 5 || sa[0] != 0x90) goto fail;
+  sock_close(fd);
   return sa[4];
 fail:
-  close(fd);
+  sock_close(fd);
   return -1;
 }
 
+#ifndef _WIN32
 static atomic_int sig_seen;
 static void on_term(int sig) {
   (void)sig;
   atomic_store(&sig_seen, 1);
 }
+#endif
 
 int main(void) {
   char cfg_path[] = "harness.yaml";
@@ -284,10 +372,8 @@ int main(void) {
   mmq_config cfg = make_config(cfg_path);
   uint64_t h = 0;
 
-  manager_tid = 0;
-  pthread_t mt;
-  pthread_create(&mt, NULL, manager_thread, NULL);
-  manager_tid = mt;
+  platform_init();
+  manager_start();
 
   /* Version and argument validation. */
   CHECK(mmq_abi_version() == MMQ_ABI_VERSION, "abi version %d", mmq_abi_version());
@@ -308,9 +394,8 @@ int main(void) {
   CHECK(mmq_start(12345) == MMQ_E_STATE, "start without instance");
 
   /* Occupied listener port: start fails, resources are released. */
-  int blocker = socket(AF_INET, SOCK_STREAM, 0);
-  int one = 1;
-  setsockopt(blocker, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sock_t blocker = socket(AF_INET, SOCK_STREAM, 0);
+  sock_reuse_addr(blocker);
   struct sockaddr_in ba;
   memset(&ba, 0, sizeof(ba));
   ba.sin_family = AF_INET;
@@ -328,7 +413,7 @@ int main(void) {
   err[elen < sizeof(err) - 1 ? elen : sizeof(err) - 1] = 0;
   CHECK(elen > 0 && strstr(err, "27191"), "failure reason: %s", err);
   CHECK(mmq_destroy(h) == MMQ_OK, "destroy failed instance");
-  close(blocker);
+  sock_close(blocker);
 
   /* Normal lifecycle. */
   CHECK(mmq_create(&cfg, &host, &h) == MMQ_OK, "create");
@@ -368,9 +453,11 @@ int main(void) {
   CHECK(code == 0x01, "plain subscribe SUBACK 0x%02x", code);
   CHECK(atomic_load(&submit_from_manager) == 0, "library submitted from the manager thread");
 
+#ifndef _WIN32
   /* A host signal handler installed after the Go runtime, with SA_ONSTACK,
    * coexists with Go: signals delivered to arbitrary threads while Go works
-   * do not crash the process. */
+   * do not crash the process. Windows has no POSIX signals, and the Go
+   * runtime uses none there. */
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = on_term;
@@ -383,6 +470,7 @@ int main(void) {
   }
   CHECK(atomic_load(&sig_seen) == 1, "SIGTERM handler not called");
   CHECK(mmq_state(h, NULL, 0, NULL) == MMQ_STATE_RUNNING, "running after signals");
+#endif
 
   /* Stop while the host keeps dispatching; idempotent. */
   CHECK(mmq_stop(h, 5000) == MMQ_OK, "stop");
@@ -396,15 +484,15 @@ int main(void) {
   CHECK(mmq_stop(h, 10) == MMQ_E_STATE, "stop after destroy");
 
   /* The port is free again after stop. */
-  int probe = socket(AF_INET, SOCK_STREAM, 0);
-  setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sock_t probe = socket(AF_INET, SOCK_STREAM, 0);
+  sock_reuse_addr(probe);
   ba.sin_port = htons(27190);
   CHECK(bind(probe, (struct sockaddr *)&ba, sizeof(ba)) == 0, "listener port still bound after stop");
-  close(probe);
+  sock_close(probe);
 
   atomic_store(&running, 0);
-  pthread_cond_signal(&qcv);
-  pthread_join(mt, NULL);
+  q_signal();
+  manager_join();
   CHECK(atomic_load(&logs) > 0, "no log lines received");
 
   if (failures) {
