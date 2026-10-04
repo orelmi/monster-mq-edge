@@ -44,11 +44,11 @@ Fixtures: `winccoa/scripts/mmqCreateTypes.ctl`, `mmqLiveFixture.ctl`,
 | AC | Status | Evidence |
 |---|---|---|
 | AC-04 | Met | `make build`, `build-arm64`, `build-armv7`: pass, `CGO_ENABLED=0`, statically linked. `go list -deps ./cmd/monstermq-edge` has no `runtime/cgo` or `embed/cabi`. `make lint`, `make test` and `make test-race` pass (see results). |
-| AC-05 | Met (Linux aarch64, gcc, c-archive) | `make embed-test`: plain C host links `libmonstermq.a` through `monstermq.h`; checks ABI version, short structs, ABI mismatch, NULL pointers, missing submit, zero-length and binary payloads, oversized inputs, stale handle, second instance, calls after destroy. The ABI has no QoS parameter (QoS is decided by the broker), so "invalid QoS" does not apply. Only Linux aarch64 c-archive is claimed. |
+| AC-05 | Met (Linux aarch64, gcc, c-archive); Pending (Windows x64, MSVC host, mingw-w64 c-shared) | `make embed-test`: plain C host links `libmonstermq.a` through `monstermq.h`; checks ABI version, short structs, ABI mismatch, NULL pointers, missing submit, zero-length and binary payloads, oversized inputs, stale handle, second instance, calls after destroy. The ABI has no QoS parameter (QoS is decided by the broker), so "invalid QoS" does not apply. Windows: see "Windows x64" below; the MSVC-linked harness (`winccoa\build.bat --test`) is still to be run. |
 | AC-06 | Met | Manager counts SDK work executed off the dispatch thread: `offThreadCalls=0` in every statistics line, including the 2000/s load (120k writes, 120k hotlinks) and store restarts. simhost and the C harness assert the same on the Go side. Startup store loads, runtime writes, publishing and shutdown disconnects complete while dispatch continues (TestLiveStoresRestart, TestLiveBackupRestore). |
 | AC-07 | Met | Live `TestLiveOverload` (manager with `queueCapacity = 16`): 1000-command burst -> 932 refused at the full queue, 68 confirmed, every command reported an outcome, queue high-water 16, manager recovers. Simulated `TestNativeOverload` covers paused completion and proves expired requests are never executed late. |
 | AC-08 | Met | Live: invalid config (exit 1 in 109 ms, `mmq_create failed`), occupied port (exit 1, bind error, first manager unaffected), unreachable Event manager (never ready, SIGTERM exit in 5 ms), SIGTERM during startup (2-255 ms), SIGTERM under 2000/s traffic (838 ms, port released), repeated stop (C harness). Missing/wrong DPT and failed store load: `TestNativeStoreMissingType`, `TestNativeStartupFailures` (the DPT check itself runs live at every start). Fixed during the live run: SIGTERM was ignored while `connectToEvent` retried (now a raw `SA_ONSTACK` handler). |
-| AC-09 | Met except the soak part (deferred with AC-35) | Live `TestLiveNoGrowth`: 100 subscribe cycles and 10 device create/delete cycles return to `connects=0 queries=0 liveCallbacks=1`. `make embed-check`: cgocheck2 and AddressSanitizer clean. SIGINT/SIGTERM stop the manager cleanly. 40 min of soak rounds: RSS flat. |
+| AC-09 | Met except the soak part (deferred with AC-35); Windows pending | Live `TestLiveNoGrowth`: 100 subscribe cycles and 10 device create/delete cycles return to `connects=0 queries=0 liveCallbacks=1`. `make embed-check`: cgocheck2 and AddressSanitizer clean. SIGINT/SIGTERM stop the manager cleanly. 40 min of soak rounds: RSS flat. |
 
 ## 10.3 Baseline query publishing
 
@@ -98,6 +98,44 @@ AC-27 to AC-33: **Deferred** (dual-node exception not granted; spec section 1).
 | AC-34 | Met | Live `cmd/mmqload`, 5000 float DPEs, 50 subscribers, 4 writers, 2000 writes/s, 60 s: 119948 sent, 119948 received, 0 lost; write -> OA -> subscriber p50 2.1 ms, p95 8.0 ms, p99 18.2 ms, max 63 ms; manager CPU 22.6 s over the run (about 0.3 cores), RSS 138 MiB, host queue high-water 54, pending high-water 61, no overload or dropped event. Budgets (spec 7): p99 <= 150 ms round trip, no loss, RSS <= 256 MiB. GraphQL comparison removed from scope by the owner. |
 | AC-35 | Deferred by the owner | The WinCC OA demo licence of `Test321` stops the project about every 4 h (21:31, "License timer expired"), so a continuous 24 h soak cannot run on this installation. Partial evidence: 4 rounds of 10 min at 2000 writes/s with fresh clients, 4.8 M values, 0 lost, p99 11-35 ms, RSS 132-145 MiB flat. On the licence stop the manager reported in-flight writes as failed and stopped cleanly. |
 | AC-36 | Met | winccoa/README.md (build, setup, DPT scripts, bootstrap example, diagnostics and statistics, connection loss, backup/restore, limits, rollback); `TestExampleConfigsValidate`; GraphQL SDL unchanged. Deferred: AC-27..AC-33 (M6). |
+
+## Windows x64 (2026-10-04)
+
+Target and build mode: spec section 2, "Windows target". Status: built and
+exercised without WinCC OA; the MSVC build and the live checks below are
+pending on a Windows host with the WinCC OA 3.21 API and Visual Studio 2022.
+
+Verified on Linux (Ubuntu 24.04 x86_64, Go 1.26.0, mingw-w64 gcc 13, Wine 9.0):
+
+- `make embed-dll`: `monstermq.dll` exports exactly the eight `mmq_*`
+  functions of `embed/cabi/monstermq.def` and imports only `KERNEL32.dll`
+  and the C runtime (`x86_64-w64-mingw32-objdump -p`).
+- `make embed-dll-test`: the C harness, linked through an import library
+  made from `monstermq.def`, passes under Wine (all checks except the POSIX
+  signal block, which does not apply on Windows; the occupied-port and
+  freed-port checks run without `SO_REUSEADDR`).
+- `make embed-test` still passes on Linux with the same harness source.
+  The harness now answers `TYPE_CHECK`, which the broker sends for
+  `MMQTopic` since the topics branch; before, both platforms failed at start.
+- `winccoa/manager/MmqPlatform.cxx` built with g++ and mingw-w64 g++
+  (`-Wall -Wextra -Werror`): absolute path rules (drive, UNC,
+  drive-relative), UTF-8 project directory with non-ASCII characters, stop
+  handler (Linux signals).
+- `winccoa\build.bat` run under Wine `cmd` with stand-in tools: argument
+  parsing, DLL step environment kept out of the CMake step, harness run,
+  install, error paths.
+
+Pending on Windows:
+
+| Check | How |
+|---|---|
+| MSVC build of the harness and the manager | `winccoa\build.bat --test` in the x64 Native Tools Command Prompt for VS 2022, once with `--msys2` (or gcc on PATH) and once with `--skip-dll` after `make embed-dll` in an MSYS2 UCRT64 shell |
+| Start and readiness | manager in PMON (`WCCOAmmq -num <n>`): `broker running` in the log, `winccoa/systems/<System>` retained status, MQTT and GraphQL ports reachable |
+| Stores and namespace | `MMQConfigs`/`MMQSessions`/`MMQRetained`/`MMQTopic` created at start; native subscribe, wildcard subscribe, write via `.../set` |
+| Stop | PMON stop and restart; Ctrl+C on a console-started manager (`broker` stops within `stopTimeoutMs`, port released) |
+| Lifecycle failures (AC-08) | invalid config, occupied port: `broker failed: ...`, exit code 1 |
+| Latency | MQTT write -> OA -> subscriber round trip with `dispatchMs = 2` (`cmd/mmqload`), to confirm the 1 ms timer resolution |
+| Live tests | `go test ./test/integration -run TestLive` against the Windows project (paths and stop/start commands adapted) |
 
 ## Results
 

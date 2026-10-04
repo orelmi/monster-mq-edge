@@ -18,6 +18,7 @@ Recorded 2026-09-29 by the repository owner.
 | GraphQL contract | Unchanged. No SDL or resolver change. Native transport is selected by host bootstrap configuration (section 6), not by a GraphQL field. |
 | Availability/durability | Native scope single node; non-OA publishes may be forwarded by PeerLink (M6a, RPO per plan-peerlink 15.4). Store success means OA-confirmed `dpSet` answer (section 5). |
 | PeerLink (M6a, recorded 2026-10-03) | In-memory, pull-based forwarding of publishes between MonsterMQ Edge brokers ([plan-peerlink.md](plan-peerlink.md)). It supersedes only the "non-OA publishes" paragraph of [plan-winccoa-broker-embedded-manager.md](plan-winccoa-broker-embedded-manager.md) §7.2, and only for in-memory forwarding. AC-27..AC-33 stay deferred; AC-28 (PUBACK barrier) and AC-30 (full recovery on overflow) are explicitly replaced by plan-peerlink sections 15 and 8.5. While native mode is active, `<TopicRoot>` is never forwarded and each node's status stays local. The entry also covers the optional `peerLink` object in the native status JSON (plan-peerlink 20.2). No ABI, C++ manager or SDL change. |
+| Windows x64 target (proposed 2026-10-04, pending owner approval) | WinCC OA 3.21 on Windows x64 is added next to Debian 12 aarch64 (section 2). cgo cannot use MSVC, so the library is built as a `c-shared` DLL (`monstermq.dll`) by a mingw-w64 gcc (`make embed-dll` in MSYS2 or cross-compiled, or `winccoa/build.bat`) and linked by the MSVC-built manager through an import library made from `embed/cabi/monstermq.def`. Same package, build tag and ABI (version 1); the standalone targets stay `CGO_ENABLED=0`. Platform code of the manager is in `winccoa/manager/MmqPlatform.cxx`. No ABI, SDL, store layout or broker change. |
 
 ## 2. Verified SDK target (AC-02)
 
@@ -28,7 +29,18 @@ Recorded 2026-09-29 by the repository owner.
 | Compiler | system gcc/g++ (Debian 12), C++17 (`CMAKE_CXX_STANDARD 17` from `CMakeDefines.txt`) |
 | Go | 1.25 language level (`go.mod`); built with the installed Go toolchain |
 | Test project | `~/WinCC_OA_Proj/Test321` |
-| Build mode | `c-archive` linked into the manager executable. `c-shared` and Windows are not claimed. |
+| Build mode | `c-archive` linked into the manager executable. |
+
+Windows target (decision of 2026-10-04 in section 1):
+
+| Item | Value |
+|---|---|
+| WinCC OA | 3.21, API at `C:\Siemens\Automation\WinCC_OA\3.21\api` |
+| OS / arch | Windows x64 |
+| Compiler | Manager: MSVC (Visual Studio 2022), C++17. Library: Go with a mingw-w64 gcc for cgo (MSYS2 UCRT64 or any mingw-w64 distribution); cgo does not support MSVC. |
+| Build mode | `c-shared`: `monstermq.dll` with exactly the `mmq_*` exports listed in `embed/cabi/monstermq.def`; the manager links the MSVC import library generated from that file with `lib.exe` and loads the DLL from its own directory. A mingw `c-archive` linked into an MSVC executable is not claimed. |
+| Signals | The Go runtime uses no POSIX signals on Windows; the manager's raw stop handler is a console control handler (Ctrl+C, Ctrl+Break). The SDK's `signalHandler` override is unchanged. |
+| Timer | The manager raises the process timer resolution to 1 ms (`timeBeginPeriod`), otherwise the `dispatchMs` wait lasts at least 15.6 ms. |
 
 Header facts checked in `/opt/WinCC_OA/3.21/api/include/Manager/Manager.hxx`:
 
@@ -45,7 +57,8 @@ Demonstrated live by the probe (acceptance record, AC-02): `del=true` keeps a ho
 ## 3. C ABI (header `embed/cabi/monstermq.h`)
 
 - ABI version `MMQ_ABI_VERSION = 1`. Every struct begins with `uint32_t struct_size`; the library rejects a smaller size or a different major ABI with `MMQ_E_ABI`.
-- Fixed-width integers only; default C calling convention; symbols exported with default visibility.
+- Fixed-width integers only; default C calling convention; symbols exported with default visibility (Windows: the exports listed in `embed/cabi/monstermq.def`).
+- No C runtime object crosses the boundary (no `FILE*`, no heap block released by the other side), so the library and the host may use different C runtimes (mingw-w64 DLL, MSVC manager).
 - One broker instance per process, enforced: a second `mmq_create` returns `MMQ_E_STATE`. The handle is opaque (`uint64_t`).
 - Lifecycle: `mmq_create` (validate config, no listeners) -> `mmq_start` (asynchronous; poll `mmq_state`) -> `mmq_stop(timeout_ms)` (asynchronous, idempotent) -> `mmq_destroy` (only after state `STOPPED` or `FAILED`). Calls after destroy return `MMQ_E_STATE`.
 - Go -> host requests: the host registers `submit(user, const mmq_request*)`. It is called on arbitrary Go threads, must copy the request and return immediately (`MMQ_OK` or `MMQ_E_OVERLOAD`). The request buffer is valid only during the call. An optional `wake(user)` callback lets the host interrupt its dispatch wait.

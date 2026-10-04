@@ -9,18 +9,24 @@ namespace. Design and contracts:
 - [Frozen specification (ABI, topics, limits)](../dev/plans/spec-winccoa-native.md)
 - [Acceptance status](../dev/plans/acceptance-winccoa-native.md)
 
-## Supported combination
+## Supported combinations
 
-Only this combination is claimed (spec section 2):
+Only these combinations are claimed (spec section 2):
 
-| Item | Value |
-|---|---|
-| WinCC OA | 3.21 (`/opt/WinCC_OA/3.21/api`) |
-| OS / arch | Debian 12, aarch64 (Linux only; no Windows DLL) |
-| Library | `libmonstermq.a` (Go `-buildmode=c-archive`) |
-| Compiler | system gcc/g++, C++17 |
+| Item | Linux | Windows |
+|---|---|---|
+| WinCC OA | 3.21 (`/opt/WinCC_OA/3.21/api`) | 3.21 (`C:\Siemens\Automation\WinCC_OA\3.21\api`) |
+| OS / arch | Debian 12, aarch64 | Windows x64 |
+| Library | `libmonstermq.a` (Go `-buildmode=c-archive`) | `monstermq.dll` (Go `-buildmode=c-shared`, mingw-w64 gcc) |
+| Manager compiler | system gcc/g++, C++17 | MSVC (Visual Studio 2022), C++17 |
+| Deployed files | `WCCOAmmq` | `WCCOAmmq.exe` and `monstermq.dll` |
+
+The Windows build is not yet validated against a live WinCC OA project
+(acceptance record, "Windows x64").
 
 ## Build
+
+### Linux
 
 ```bash
 export API_ROOT=/opt/WinCC_OA/3.21/api
@@ -37,12 +43,63 @@ stops and starts that PMON manager via `woa`):
 ./winccoa/build.sh --test --restart 11
 ```
 
+### Windows
+
+cgo does not support MSVC, so the broker DLL is built by Go with a
+mingw-w64 gcc, and the manager by MSVC with the WinCC OA API. The manager
+links `monstermq.dll` through an import library that CMake makes from
+`embed/cabi/monstermq.def` with `lib.exe`, and the DLL is copied next to
+`WCCOAmmq.exe`. The C ABI passes no C runtime object, so the two C runtimes
+do not mix.
+
+Requirements: Visual Studio 2022 17.5 or later with "Desktop development
+with C++" (includes CMake), Go (version of `go.mod`), the WinCC OA 3.21 API,
+and a mingw-w64 gcc: [MSYS2](https://www.msys2.org/) with
+`pacman -S mingw-w64-ucrt-x86_64-gcc`, or any other mingw-w64 distribution.
+
+In an "x64 Native Tools Command Prompt for VS 2022":
+
+```bat
+set API_ROOT=C:\Siemens\Automation\WinCC_OA\3.21\api
+winccoa\build.bat --test
+winccoa\build.bat --install C:\WinCC_OA_Proj\Test321
+```
+
+`winccoa\build.bat` builds `build\embed-windows\monstermq.dll`, runs the C
+ABI harness linked by MSVC (`--test`), builds `WCCOAmmq.exe` (Release) and
+copies both files to `<project>\bin` (`--install`; stop the manager first).
+The gcc for the DLL is taken from `--cc <gcc.exe>`, `--msys2`
+(`%MSYS2_ROOT%\ucrt64\bin\gcc.exe`, default `C:\msys64`), `gcc` on `PATH`,
+or the MSYS2 UCRT64 gcc, in this order. `--clean` reconfigures CMake from
+scratch. The dashboard is embedded when `dashboard\dist` or
+`..\dashboard\dist` exists, otherwise the broker serves its placeholder
+page.
+
+The DLL can also be built in an MSYS2 UCRT64 shell
+(`pacman -S make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-go`), then
+the manager in the Visual Studio prompt:
+
+```bash
+make embed-dll                        # build/embed-windows/monstermq.dll (needs the dashboard like embed-lib;
+                                      # make -o prepare-dashboard embed-dll builds without it)
+make embed-dll-test                   # optional: the C ABI harness linked by gcc
+```
+
+```bat
+winccoa\build.bat --skip-dll --install C:\WinCC_OA_Proj\Test321
+```
+
+On Linux, `make embed-dll` cross-compiles the DLL with
+`x86_64-w64-mingw32-gcc`, and `make embed-dll-test` runs the harness with
+`wine`.
+
 The standalone broker is unaffected: `make build`, `build-arm64` and
 `build-armv7` stay `CGO_ENABLED=0` and never link the embedding library.
 
 ## Project setup
 
-1. Copy `WCCOAmmq` to `<project>/bin`.
+1. Copy `WCCOAmmq` to `<project>/bin` (Windows: `WCCOAmmq.exe` and
+   `monstermq.dll`, or `winccoa\build.bat --install <project>`).
 2. The store datapoint types (`MMQConfigs`, `MMQSessions`, `MMQRetained`)
    are created by the manager at startup when a store type is `WINCCOA` and
    the type is missing. An existing type is never changed: with a different
@@ -74,6 +131,10 @@ The standalone broker is unaffected: `make build`, `build-arm64` and
    `liveCallbacks`, `queued`, `queueHighWater`, `overloads`, `offThreadCalls`,
    `setMessages`, `setItems`, `hotlinkItems`); set `MMQ_STATS_SECONDS` in the
    manager environment for the broker-side `host client stats` line.
+6. Windows: allow the broker's listener ports (MQTT, GraphQL, ...) in the
+   Windows firewall. `brokerConfig` may also be an absolute path
+   (`C:\...`). A manager started from a console stops cleanly on Ctrl+C or
+   Ctrl+Break.
 
 ## Readiness and diagnostics
 
