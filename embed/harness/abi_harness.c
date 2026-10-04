@@ -180,6 +180,8 @@ static void *manager_thread(void *arg) {
           put_field(out, &off, 11, "HarnessSys", 10);
           break;
         }
+        case 12: /* TYPE_CHECK: every type exists with the requested layout (MMQTopic at start) */
+          break;
         default: {
           const char *e = "operation not supported by the harness";
           put_field(out, &off, 7, e, (uint32_t)strlen(e));
