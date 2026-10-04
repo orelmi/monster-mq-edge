@@ -1,9 +1,9 @@
 #include "MonsterMQManager.hxx"
 #include "MonsterMQResources.hxx"
+#include "MmqPlatform.hxx"
 
 #include <csignal>
-#include <unistd.h>
-#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <thread>
@@ -85,47 +85,9 @@ void DistWait::hotLinkCallBack(DpHLGroup &group)
 }
 
 // ---------------------------------------------------------------------------
-// Signals: the Go runtime (c-archive) installs handlers for synchronous and
-// runtime signals before main. WinCC OA may install its own afterwards.
-
-static const int runtimeSignals[] = {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGURG, SIGPROF};
-static struct sigaction goHandlers[sizeof(runtimeSignals) / sizeof(runtimeSignals[0])];
-
-void MonsterMQManager::saveRuntimeSignals()
-{
-  for (size_t i = 0; i < sizeof(runtimeSignals) / sizeof(runtimeSignals[0]); i++)
-    sigaction(runtimeSignals[i], nullptr, &goHandlers[i]);
-}
-
-// Reinstalls the Go handlers where WinCC OA replaced them, so Go runtime
-// faults and preemption keep working inside the embedded library.
-void MonsterMQManager::restoreRuntimeSignals()
-{
-  for (size_t i = 0; i < sizeof(runtimeSignals) / sizeof(runtimeSignals[0]); i++)
-  {
-    struct sigaction cur;
-    if (sigaction(runtimeSignals[i], nullptr, &cur) != 0)
-      continue;
-    if (cur.sa_handler != goHandlers[i].sa_handler)
-      sigaction(runtimeSignals[i], &goHandlers[i], nullptr);
-  }
-}
-
-// Every non-default handler must run on the alternate signal stack, because
-// the signal can arrive on a Go-owned thread with a small stack.
-void MonsterMQManager::addOnStackToHandlers()
-{
-  for (int sig = 1; sig < NSIG; sig++)
-  {
-    struct sigaction sa;
-    if (sigaction(sig, nullptr, &sa) != 0)
-      continue;
-    if (sa.sa_handler == SIG_DFL || sa.sa_handler == SIG_IGN || (sa.sa_flags & SA_ONSTACK))
-      continue;
-    sa.sa_flags |= SA_ONSTACK;
-    sigaction(sig, &sa, nullptr);
-  }
-}
+// Signals: the Go runtime installs handlers for synchronous and runtime
+// signals before main (Linux; see MmqPlatform). WinCC OA may install its own
+// afterwards.
 
 void MonsterMQManager::signalHandler(int sig)
 {
@@ -137,33 +99,22 @@ void MonsterMQManager::signalHandler(int sig)
   Manager::signalHandler(sig);
 }
 
-// Raw SIGINT/SIGTERM handler. The SDK's sigHdl defers to dispatch(), which
-// does not run while connectToEvent sleeps between 20 s retries. Before the
-// broker exists there is nothing to flush, so the process ends at once
-// (_exit is async-signal-safe); afterwards only the exit flag is set and the
-// main loop stops the broker in order. Installed with SA_ONSTACK because
-// the signal may arrive on a Go runtime thread.
-static void onExitSignal(int)
-{
-  MonsterMQManager::requestExit();
-}
-
+// Raw stop handler (SIGINT/SIGTERM; Ctrl+C/Ctrl+Break on Windows). The
+// SDK's sigHdl defers to dispatch(), which does not run while
+// connectToEvent sleeps between 20 s retries. Before the broker exists there
+// is nothing to flush, so the process ends at once (_Exit is
+// async-signal-safe); afterwards only the exit flag is set and the main loop
+// stops the broker in order.
 void MonsterMQManager::requestExit()
 {
   if (!brokerStarted)
-    _exit(0);
+    std::_Exit(0);
   doExit = true;
 }
 
 void MonsterMQManager::installExitSignals()
 {
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = onExitSignal;
-  sa.sa_flags = SA_ONSTACK | SA_RESTART;
-  sigemptyset(&sa.sa_mask);
-  sigaction(SIGINT, &sa, nullptr);
-  sigaction(SIGTERM, &sa, nullptr);
+  mmq::installStopHandler(&MonsterMQManager::requestExit);
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,9 +1180,9 @@ int MonsterMQManager::run()
   if (doExit)
     return 0;
 
-  restoreRuntimeSignals();
+  mmq::restoreRuntimeSignals();
   installExitSignals();
-  addOnStackToHandlers();
+  mmq::addOnStackToHandlers();
   getSystemName(localSystem);
   localSysNum = DpIdentification::getDefaultSystem();
 
@@ -1250,12 +1201,13 @@ int MonsterMQManager::run()
 
   // Relative paths in the broker config (SQLite.Path, key stores, ...) are
   // resolved against the project directory, not PMON's working directory.
-  if (chdir((const char *)Resources::getProjDir()) != 0)
+  std::string cdErr = mmq::changeDirectory((const char *)Resources::getProjDir());
+  if (!cdErr.empty())
     logLine(MMQ_LOG_WARN, "cannot change to project directory " + std::string((const char *)Resources::getProjDir()) +
-                              ": " + std::strerror(errno));
+                              ": " + cdErr);
 
   CharString cfgPath = MonsterMQResources::getBrokerConfig();
-  if (cfgPath.len() && ((const char *)cfgPath)[0] != '/')
+  if (cfgPath.len() && !mmq::isAbsolutePath((const char *)cfgPath))
     cfgPath = Resources::getProjDir() + "/" + cfgPath;
   mmq_config cfg;
   memset(&cfg, 0, sizeof(cfg));
@@ -1292,6 +1244,7 @@ int MonsterMQManager::run()
       event(0, ev);
   }
   mmq_start(handle);
+  mmq::raiseTimerResolution();
 
   bool failed = false, announced = false;
   char errBuf[1024];

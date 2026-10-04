@@ -1,6 +1,7 @@
 // Entry point of the MonsterMQ embedding manager (WCCOAmmq).
 #include "MonsterMQManager.hxx"
 #include "MonsterMQResources.hxx"
+#include "MmqPlatform.hxx"
 
 #include <Utf8Argv.hxx>
 
@@ -8,7 +9,7 @@ int main(int argc, char *argv[])
 {
   // The Go runtime installed its handlers before main; keep a copy so they
   // can be restored if WinCC OA replaces them.
-  MonsterMQManager::saveRuntimeSignals();
+  mmq::saveRuntimeSignals();
 
   Utf8Argv utf8Argv(argc, argv);
   MonsterMQManager::installExitSignals();

@@ -146,11 +146,7 @@ class MonsterMQManager : public Manager
     void onDistState(const Variable *v);
     void onSetBatchAnswer(const std::vector<SetBatchWait::Entry> &entries, DpMsgAnswer &answer);
 
-    // Saves the Go runtime's handlers for the synchronous and runtime
-    // signals before WinCC OA installs its own (called first in main).
-    static void saveRuntimeSignals();
-
-    // Installs the raw SIGINT/SIGTERM handler (see requestExit).
+    // Installs the raw stop handler (see requestExit).
     static void installExitSignals();
     static void requestExit();
 
@@ -248,8 +244,6 @@ class MonsterMQManager : public Manager
     void connectDistState();
     void reportDpChange(SystemNumType system, DpIdType dp, DpTypeId type);
     static std::string answerError(DpMsgAnswer &answer);
-    static void restoreRuntimeSignals();
-    static void addOnStackToHandlers();
     int runProbe();
 };
 
