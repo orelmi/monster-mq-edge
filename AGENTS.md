@@ -114,8 +114,10 @@ internal/
                            # peerlink/wire/ is the mmq-peer/1 codec
   tlsutil/                 # TLS helpers (key pairs, truststores, pins, NodeId
                            # identity, self-signed peer certificates)
-embed/cabi/                # cgo C ABI (c-archive) for the WinCC OA manager
-embed/harness/             # plain C host exercising the ABI (make embed-test)
+embed/cabi/                # cgo C ABI for the WinCC OA manager (c-archive on Linux,
+                           # c-shared monstermq.dll + monstermq.def on Windows)
+embed/harness/             # plain C host exercising the ABI (make embed-test,
+                           # make embed-dll-test)
 winccoa/manager/           # C++ WinCC OA API manager embedding the broker
 test/integration/          # black-box tests (Go; drive the full broker)
 config.yaml.example        # sample config — Features, no Bridges/Dashboard
@@ -129,7 +131,8 @@ dev/done/                  # completed or archived plans
 - **Go 1.26**. Generics are fine. Don't introduce CGO — pure Go is a
   shipping requirement for cross-compile to ARM. The single approved
   exception (2026-09-29) is the opt-in WinCC OA embedding library in
-  `embed/cabi/` (build tag `winccoa_embed`, `make embed-lib`); the standalone
+  `embed/cabi/` (build tag `winccoa_embed`, `make embed-lib`, and
+  `make embed-dll` for the Windows DLL); the standalone
   binary must never import it. See `dev/plans/spec-winccoa-native.md`.
 - Storage interfaces in `internal/stores/interfaces.go` are the contract.
   Backends implement them; consumers depend only on the interface.

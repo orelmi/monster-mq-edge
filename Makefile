@@ -6,7 +6,7 @@ VERSION := $(shell cat version.txt 2>/dev/null | tr -d '\n' | tr -d '\r')
 LDFLAGS := -s -w -X monstermq.io/edge/internal/version.Version=$(VERSION)
 GOFLAGS := -trimpath
 
-.PHONY: build build-arm64 build-armv7 test test-race lint clean gen run deb-arm64 deb-armv7 deb-amd64 deb-all release publish prepare-dashboard embed-lib embed-test embed-check
+.PHONY: build build-arm64 build-armv7 test test-race lint clean gen run deb-arm64 deb-armv7 deb-amd64 deb-all release publish prepare-dashboard embed-lib embed-test embed-check embed-dll embed-dll-test
 
 prepare-dashboard:
 	@if [ -e "dashboard" ] || [ -L "dashboard" ]; then \
@@ -101,8 +101,36 @@ embed-check:
 	$(CC) -std=c11 -g -fsanitize=address -fno-omit-frame-pointer -Wall -Wextra -Werror -Ibuild/embed-asan -o build/embed-asan/abi_harness embed/harness/abi_harness.c build/embed-asan/libmonstermq.a -lpthread
 	cd embed/harness && ASAN_OPTIONS=detect_leaks=1 ../../build/embed-asan/abi_harness
 
+# Windows x64 build of the embedding library: monstermq.dll for the
+# MSVC-built manager (winccoa/build.bat links it through an import library
+# made from monstermq.def). cgo needs a mingw-w64 C compiler: gcc in an
+# MSYS2 UCRT64 shell, x86_64-w64-mingw32-gcc when cross-compiling.
+EMBED_WIN_OUT := build/embed-windows
+ifeq ($(OS),Windows_NT)
+WIN_CC ?= gcc
+WIN_DLLTOOL ?= dlltool
+WIN_RUN ?=
+else
+WIN_CC ?= x86_64-w64-mingw32-gcc
+WIN_DLLTOOL ?= x86_64-w64-mingw32-dlltool
+WIN_RUN ?= wine
+endif
+
+embed-dll: prepare-dashboard
+	mkdir -p $(EMBED_WIN_OUT)
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=$(WIN_CC) go build $(GOFLAGS) -tags winccoa_embed -buildmode=c-shared -ldflags="-X monstermq.io/edge/internal/version.Version=$(VERSION)" -o $(EMBED_WIN_OUT)/monstermq.dll ./embed/cabi
+	# go build writes its own monstermq.h next to the DLL; the published header replaces it.
+	cp embed/cabi/monstermq.h embed/cabi/monstermq_types.h embed/cabi/monstermq.def $(EMBED_WIN_OUT)/
+
+# The C harness linked against the DLL through an import library made from
+# monstermq.def, run natively (MSYS2) or with WIN_RUN (wine) when cross-compiling.
+embed-dll-test: embed-dll
+	$(WIN_DLLTOOL) -d $(EMBED_WIN_OUT)/monstermq.def -l $(EMBED_WIN_OUT)/libmonstermq.dll.a
+	$(WIN_CC) -std=c11 -Wall -Wextra -Werror -I$(EMBED_WIN_OUT) -o $(EMBED_WIN_OUT)/abi_harness.exe embed/harness/abi_harness.c $(EMBED_WIN_OUT)/libmonstermq.dll.a -lws2_32
+	cd embed/harness && $(WIN_RUN) ../../$(EMBED_WIN_OUT)/abi_harness.exe
+
 clean:
-	rm -rf bin dist build/embed build/embed-check build/embed-asan
+	rm -rf bin dist build/embed build/embed-check build/embed-asan build/embed-windows
 	@find internal/dashboard/dist -mindepth 1 ! -name 'placeholder.html' -exec rm -rf {} + 2>/dev/null || true
 
 gen:

@@ -1,0 +1,14 @@
+; monstermq.def - exports of monstermq.dll, the Windows build of the
+; embeddable broker (make embed-dll). The MSVC import library is made from
+; this file: lib /def:monstermq.def /machine:x64 /out:monstermq.lib
+; Keep it in sync with monstermq.h.
+LIBRARY monstermq.dll
+EXPORTS
+    mmq_abi_version
+    mmq_create
+    mmq_start
+    mmq_state
+    mmq_stop
+    mmq_destroy
+    mmq_complete
+    mmq_event
